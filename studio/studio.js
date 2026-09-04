@@ -14,6 +14,7 @@ async function start(){if(token){try{me=(await api('/auth/me')).user;demo=false;
 function setHealth(ok=true,msg='Production engine ready'){$('#health').className='health '+(ok?'ok':'warn');$('#health').textContent=ok?'● READY':'● CHECK';$('#signalText').textContent=msg}
 function streamFor(type){if(type==='camera')return state.camera;if(type==='screen')return state.screen;return null}
 function previewSource(type){const v=$('#previewVideo');if(!v)return;const stream=streamFor(type);if(stream){v.srcObject=stream;v.removeAttribute('src');v.play().catch(()=>{})}else if(type==='media'&&state.mediaUrl){v.srcObject=null;v.src=state.mediaUrl;v.controls=false;v.play().catch(()=>{})}else{v.srcObject=null;v.removeAttribute('src');v.pause()}}
+function updatePreviewGraphic(){const el=$('#previewGraphic');if(!el)return;const g=state.graphics;if(!g||!g.onAir){el.hidden=true;el.innerHTML='';return}el.hidden=false;el.innerHTML=`<strong>${esc(g.headline||'')}</strong><small>${esc(g.sub||'')}</small>`}
 function renderMonitor(){
  const p=$('#programVideo');
  if(p){
