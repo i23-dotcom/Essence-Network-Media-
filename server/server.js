@@ -24,6 +24,7 @@ app.use('/live',express.static(liveDir,{setHeaders:(res,file)=>{if(file.endsWith
 let ffmpegProc=null;
 let programProc=null;
 const transmissionState=new Map();
+const transmissionJobs=new Map();
 let engineState={running:false,started_at:null,input:null,output:null,mode:null,last_error:null,pid:null};
 let programState={running:false,started_at:null,output:'/live/program.m3u8',mode:null,last_error:null,pid:null,bytes:0,channel_id:null};
 function ensureDefaultStation(){
@@ -37,22 +38,60 @@ function ensureDefaultStation(){
   db.prepare(`INSERT INTO transmission_outputs(channel_id,name,type,endpoint,format,audio_format,enabled,primary_output,notes,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id,'Primary Program Output','file','live/program.m3u8','1080p25','stereo',1,1,'Station program bus / broadcast bridge output',now);
 }
 
-function stopEngine(){if(ffmpegProc){try{ffmpegProc.kill('SIGTERM')}catch{}ffmpegProc=null}engineState={...engineState,running:false,pid:null};}
+function stopEngine(){if(ffmpegProc){try{ffmpegProc.kill('SIGTERM')}catch{}ffmpegProc=null}engineState={...engineState,running:false,pid:null,reconnecting:false};}
 function stopProgramStream(){if(programProc){try{programProc.stdin.end()}catch{}try{programProc.kill('SIGTERM')}catch{}programProc=null}programState={...programState,running:false,pid:null};}
 function startProgramStream({mode='hls',output='',channel_id=null}){if(programProc)stopProgramStream();const args=['-hide_banner','-loglevel','warning','-fflags','+genpts','-f','webm','-i','pipe:0','-c:v','libx264','-preset','veryfast','-tune','zerolatency','-pix_fmt','yuv420p','-b:v','2500k','-maxrate','2500k','-bufsize','5000k','-g','60','-c:a','aac','-b:a','128k','-ar','48000'];if(mode==='rtmp'){if(!output||!/^rtmps?:\/\//i.test(output))throw Error('RTMP output URL required');args.push('-f','flv',output)}else{args.push('-f','hls','-hls_time','2','-hls_list_size','6','-hls_flags','delete_segments+append_list','-hls_segment_filename',path.join(liveDir,'program-%03d.ts'),path.join(liveDir,'program.m3u8'))}programProc=spawn('ffmpeg',args,{stdio:['pipe','ignore','pipe']});programState={running:true,started_at:new Date().toISOString(),output:mode==='hls'?'/live/program.m3u8':output,mode,last_error:null,pid:programProc.pid,bytes:0,channel_id:channel_id?Number(channel_id):null};programProc.stderr.on('data',b=>{const t=String(b);if(/error|failed|invalid/i.test(t))programState.last_error=t.slice(-800)});programProc.on('exit',(code)=>{programState={...programState,running:false,pid:null};programProc=null;if(code!==0)programState.last_error=programState.last_error||`FFmpeg exited with code ${code}`});return programState;}
-function startTransmissionBridge({input,output,protocol}){
-  if(ffmpegProc)stopEngine();
+function isRecentLiveFile(file,maxAge=8000){try{const st=fs.statSync(file);return st.size>0&&(Date.now()-st.mtimeMs)<maxAge}catch{return false}}
+function waitForLiveFile(file, timeout=12000){
+  return new Promise((resolve,reject)=>{
+    const started=Date.now();
+    const check=()=>{
+      try{
+        const st=fs.statSync(file);
+        if(st.size>0)return resolve(true);
+      }catch{}
+      if(Date.now()-started>=timeout)return reject(new Error('Program HLS output is not ready yet'));
+      setTimeout(check,250);
+    };
+    check();
+  });
+}
+function stopTransmissionJob(id){
+  const job=transmissionJobs.get(Number(id));
+  if(job){job.desired=false;if(job.timer)clearTimeout(job.timer);if(job.proc){try{job.proc.kill('SIGTERM')}catch{}}transmissionJobs.delete(Number(id));}
+  transmissionState.delete(Number(id));
+}
+async function startTransmissionBridge({id,input,output,protocol}){
   if(!input)throw Error('Program input is not available');
   if(!output)throw Error('Transmission endpoint is required');
-  const args=['-hide_banner','-loglevel','warning','-re','-i',input,'-c:v','libx264','-preset','veryfast','-tune','zerolatency','-pix_fmt','yuv420p','-b:v','2500k','-maxrate','2500k','-bufsize','5000k','-g','50','-c:a','aac','-b:a','128k','-ar','48000'];
-  if(protocol==='rtmp'||protocol==='rtmps') args.push('-f','flv',output);
-  else if(['srt','udp','rtp'].includes(protocol)) args.push('-f','mpegts',output);
-  else throw Error('Unsupported IP transmission protocol');
-  ffmpegProc=spawn('ffmpeg',args,{stdio:['ignore','ignore','pipe']});
-  engineState={running:true,started_at:new Date().toISOString(),input:'/live/program.m3u8',output,mode:protocol,last_error:null,pid:ffmpegProc.pid};
-  ffmpegProc.stderr.on('data',b=>{const t=String(b);if(/error|failed|invalid/i.test(t))engineState.last_error=t.slice(-800)});
-  ffmpegProc.on('exit',(code)=>{engineState={...engineState,running:false,pid:null};ffmpegProc=null;if(code!==0)engineState.last_error=engineState.last_error||`FFmpeg exited with code ${code}`});
-  return engineState;
+  await waitForLiveFile(input);
+  if(!isRecentLiveFile(input,15000))throw Error('Program HLS output is stale. Restart Program Output and try again.');
+  stopTransmissionJob(id);
+  const job={id:Number(id),desired:true,proc:null,timer:null,retries:0,input,output,protocol};
+  transmissionJobs.set(job.id,job);
+  const launch=()=>{
+    if(!job.desired)return;
+    const args=['-hide_banner','-loglevel','warning','-fflags','+genpts','-live_start_index','-3','-i',input,'-c:v','libx264','-preset','veryfast','-tune','zerolatency','-pix_fmt','yuv420p','-b:v','2500k','-maxrate','2500k','-bufsize','5000k','-g','50','-c:a','aac','-b:a','128k','-ar','48000'];
+    if(protocol==='rtmp'||protocol==='rtmps')args.push('-f','flv',output);
+    else if(['srt','udp','rtp'].includes(protocol))args.push('-f','mpegts',output);
+    else throw Error('Unsupported IP transmission protocol');
+    const proc=spawn('ffmpeg',args,{stdio:['ignore','ignore','pipe']});
+    job.proc=proc;job.retries+=1;
+    engineState={running:true,started_at:new Date().toISOString(),input:'/live/program.m3u8',output,mode:protocol,last_error:null,pid:proc.pid,reconnecting:false,retries:job.retries};
+    const mark=(b)=>{const t=String(b);if(/error|failed|invalid|connection refused|broken pipe/i.test(t))engineState.last_error=t.slice(-1000)};
+    proc.stderr.on('data',mark);
+    proc.on('exit',(code,signal)=>{
+      if(job.proc!==proc)return;
+      job.proc=null;
+      if(!job.desired){engineState={...engineState,running:false,pid:null,reconnecting:false};return;}
+      const reason=engineState.last_error||`Transmission bridge stopped (code ${code}${signal?`, ${signal}`:''})`;
+      engineState={...engineState,running:false,pid:null,reconnecting:true,last_error:reason};
+      const delay=Math.min(10000,Math.max(1000,job.retries*1000));
+      job.timer=setTimeout(launch,delay);
+    });
+  };
+  launch();
+  return new Promise(resolve=>setTimeout(()=>resolve(engineState),350));
 }
 function startEngine({input,output,mode='hls'}){if(ffmpegProc)stopEngine();if(!input)throw Error('Input is required');const args=['-hide_banner','-loglevel','warning','-re','-i',input];if(mode==='rtmp'){if(!output||!/^rtmps?:\/\//i.test(output))throw Error('RTMP output URL required');args.push('-c:v','libx264','-preset','veryfast','-tune','zerolatency','-b:v','2500k','-maxrate','2500k','-bufsize','5000k','-g','60','-c:a','aac','-b:a','128k','-ar','48000','-f','flv',output)}else{args.push('-c:v','libx264','-preset','veryfast','-tune','zerolatency','-b:v','2500k','-maxrate','2500k','-bufsize','5000k','-g','60','-c:a','aac','-b:a','128k','-ar','48000','-f','hls','-hls_time','2','-hls_list_size','6','-hls_flags','delete_segments+append_list',path.join(liveDir,'engine.m3u8'))}ffmpegProc=spawn('ffmpeg',args,{stdio:['ignore','ignore','pipe']});engineState={running:true,started_at:new Date().toISOString(),input,output:mode==='hls'?'/live/engine.m3u8':output,mode,last_error:null,pid:ffmpegProc.pid};ffmpegProc.stderr.on('data',b=>{const t=String(b);if(/error|failed|invalid/i.test(t))engineState.last_error=t.slice(-500)});ffmpegProc.on('exit',(code)=>{engineState={...engineState,running:false,pid:null};ffmpegProc=null;if(code!==0)engineState.last_error=engineState.last_error||`FFmpeg exited with code ${code}`})}
 app.use('/assets',express.static(path.join(__dirname,'..','public')));
@@ -186,9 +225,9 @@ app.post('/api/workspace/transmission-outputs',workspaceRole(['admin','producer'
 app.put('/api/workspace/transmission-outputs/:id',workspaceRole(['admin','producer']), (req,res)=>{const old=db.prepare('SELECT * FROM transmission_outputs WHERE id=?').get(req.params.id);if(!old)return res.status(404).json({error:'Transmission output not found'});const b={...old,...(req.body||{})};db.prepare('UPDATE transmission_outputs SET channel_id=?,name=?,type=?,endpoint=?,format=?,audio_format=?,enabled=?,primary_output=?,notes=?,updated_at=? WHERE id=?').run(Number(b.channel_id),clean(b.name),clean(b.type)||'ip',clean(b.endpoint),clean(b.format)||'1080p25',clean(b.audio_format)||'stereo',Number(b.enabled)!==0,Number(b.primary_output)!==0,clean(b.notes),new Date().toISOString(),req.params.id);res.json(db.prepare('SELECT * FROM transmission_outputs WHERE id=?').get(req.params.id))});
 app.delete('/api/workspace/transmission-outputs/:id',workspaceRole(['admin']), (req,res)=>{const x=db.prepare('DELETE FROM transmission_outputs WHERE id=?').run(req.params.id);if(!x.changes)return res.status(404).json({error:'Transmission output not found'});res.json({ok:true})});
 app.post('/api/workspace/transmission-outputs/:id/test',workspaceRole(['admin','producer','operator']),(req,res)=>{const o=db.prepare('SELECT t.*,c.name channel_name,c.channel_number,c.call_sign FROM transmission_outputs t JOIN channels c ON c.id=t.channel_id WHERE t.id=?').get(req.params.id);if(!o)return res.status(404).json({error:'Transmission output not found'});if(!Number(o.enabled))return res.status(400).json({error:'Transmission output is disabled'});const type=String(o.type||'ip').toLowerCase(),ep=String(o.endpoint||'').trim();let ready=false,message='';if(['sdi','ndi','asi'].includes(type)){message=`${type.toUpperCase()} output requires compatible broadcast I/O hardware on this server`;}else if(type==='ip'){if(!ep)message='IP/encoder endpoint is not configured';else if(!/^(rtmps?|srt|udp|rtp):\/\//i.test(ep))message='Use an RTMP/RTMPS, SRT, UDP or RTP endpoint';else{ready=true;message='Endpoint format accepted; encoder/output bridge can use this destination'}}else if(type==='file'){ready=true;message='File/archive destination is available'}else message='Unsupported output interface';res.json({ok:true,test:{id:o.id,name:o.name,type,endpoint:ep,ready,message}})});
-app.post('/api/workspace/transmission-outputs/:id/activate',workspaceRole(['admin','producer','operator']),(req,res)=>{try{const o=db.prepare('SELECT t.*,c.name channel_name,c.channel_number,c.call_sign FROM transmission_outputs t JOIN channels c ON c.id=t.channel_id WHERE t.id=?').get(req.params.id);if(!o)return res.status(404).json({error:'Transmission output not found'});if(!Number(o.enabled))return res.status(400).json({error:'Transmission output is disabled'});const type=String(o.type||'ip').toLowerCase();if(['sdi','ndi','asi'].includes(type))return res.status(400).json({error:`${type.toUpperCase()} output requires compatible broadcast I/O hardware on the station server`});const ep=String(o.endpoint||'').trim();if(type==='file'){const st={active:true,started_at:new Date().toISOString(),endpoint:ep,message:'File/archive output armed'};transmissionState.set(Number(o.id),st);return res.json({ok:true,output:o,state:st,engine:engineState})}if(!/^(rtmps?|srt|udp|rtp):\/\//i.test(ep))return res.status(400).json({error:'Configure a valid RTMP/RTMPS, SRT, UDP or RTP endpoint first'});if(!programState.running)return res.status(409).json({error:'Program output is not running. Start the Program Output first, then activate transmission.'});const protocol=(ep.match(/^([a-z0-9]+):\/\//i)||[])[1]?.toLowerCase();const eng=startTransmissionBridge({input:path.join(liveDir,'program.m3u8'),output:ep,protocol});const st={active:true,started_at:new Date().toISOString(),endpoint:ep,message:`${protocol.toUpperCase()} transmission bridge is ACTIVE`};transmissionState.set(Number(o.id),st);res.json({ok:true,output:o,state:st,engine:eng})}catch(e){res.status(400).json({error:e.message})}});
-app.post('/api/workspace/transmission-outputs/:id/deactivate',workspaceRole(['admin','producer','operator']),(req,res)=>{transmissionState.delete(Number(req.params.id));res.json({ok:true,state:{active:false}})});
-app.get('/api/workspace/transmission-outputs/status',workspaceRole(['admin','producer','operator']),(req,res)=>res.json(Object.fromEntries(transmissionState.entries())));
+app.post('/api/workspace/transmission-outputs/:id/activate',workspaceRole(['admin','producer','operator']),async (req,res)=>{try{const o=db.prepare('SELECT t.*,c.name channel_name,c.channel_number,c.call_sign FROM transmission_outputs t JOIN channels c ON c.id=t.channel_id WHERE t.id=?').get(req.params.id);if(!o)return res.status(404).json({error:'Transmission output not found'});if(!Number(o.enabled))return res.status(400).json({error:'Transmission output is disabled'});const type=String(o.type||'ip').toLowerCase();if(['sdi','ndi','asi'].includes(type))return res.status(400).json({error:`${type.toUpperCase()} output requires compatible broadcast I/O hardware on the station server`});const ep=String(o.endpoint||'').trim();if(type==='file'){const st={active:true,started_at:new Date().toISOString(),endpoint:ep,message:'File/archive output armed'};transmissionState.set(Number(o.id),st);return res.json({ok:true,output:o,state:st,engine:engineState})}if(!/^(rtmps?|srt|udp|rtp):\/\//i.test(ep))return res.status(400).json({error:'Configure a valid RTMP/RTMPS, SRT, UDP or RTP endpoint first'});if(!programState.running && !isRecentLiveFile(path.join(liveDir,'program.m3u8')))return res.status(409).json({error:'Program output is not live. Start the Program Output and wait for the live programme feed before activating transmission.'});const protocol=(ep.match(/^([a-z0-9]+):\/\//i)||[])[1]?.toLowerCase();const eng=await startTransmissionBridge({id:o.id,input:path.join(liveDir,'program.m3u8'),output:ep,protocol});const st={active:true,desired:true,started_at:new Date().toISOString(),endpoint:ep,message:`${protocol.toUpperCase()} transmission bridge is ACTIVE`,reconnecting:false};transmissionState.set(Number(o.id),st);res.json({ok:true,output:o,state:st,engine:eng})}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/workspace/transmission-outputs/:id/deactivate',workspaceRole(['admin','producer','operator']),(req,res)=>{stopTransmissionJob(Number(req.params.id));if(![...transmissionJobs.values()].some(j=>j.proc)){engineState={...engineState,running:false,pid:null,reconnecting:false}}res.json({ok:true,state:{active:false,desired:false}})});
+app.get('/api/workspace/transmission-outputs/status',workspaceRole(['admin','producer','operator']),(req,res)=>{const out={};for(const [id,job] of transmissionJobs){out[id]={active:Boolean(job.proc),desired:job.desired,reconnecting:job.desired&&!job.proc,retries:job.retries,endpoint:job.output,protocol:job.protocol,last_error:engineState.last_error||null}}res.json(out)});
 app.post('/api/workspace/playout-events',workspaceRole(['admin','producer','operator']), (req,res)=>{const b=req.body||{};if(!b.channel_id||!clean(b.title))return res.status(400).json({error:'Channel and event title are required'});const x=db.prepare('INSERT INTO playout_events(channel_id,event_type,title,source,start_time,end_time,status,priority,notes,auto_take,transition,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(Number(b.channel_id),clean(b.event_type)||'program',clean(b.title),clean(b.source),clean(b.start_time),clean(b.end_time),['scheduled','ready','on-air','done','hold','cancelled'].includes(b.status)?b.status:'scheduled',Number(b.priority)||0,clean(b.notes),b.auto_take===undefined?1:Number(b.auto_take)!==0,['cut','fade','dip','manual'].includes(b.transition)?b.transition:'cut',new Date().toISOString());res.status(201).json(db.prepare('SELECT * FROM playout_events WHERE id=?').get(x.lastInsertRowid))});
 app.get('/api/workspace/playout-events',(req,res)=>res.json(db.prepare(`SELECT p.*,c.name channel_name,c.channel_number FROM playout_events p JOIN channels c ON c.id=p.channel_id ORDER BY p.channel_id,p.start_time,p.priority DESC,p.id`).all()));
 app.put('/api/workspace/playout-events/:id',workspaceRole(['admin','producer','operator']), (req,res)=>{const old=db.prepare('SELECT * FROM playout_events WHERE id=?').get(req.params.id);if(!old)return res.status(404).json({error:'Playout event not found'});const b={...old,...(req.body||{})};db.prepare('UPDATE playout_events SET channel_id=?,event_type=?,title=?,source=?,start_time=?,end_time=?,status=?,priority=?,notes=?,auto_take=?,transition=?,updated_at=? WHERE id=?').run(Number(b.channel_id),clean(b.event_type)||'program',clean(b.title),clean(b.source),clean(b.start_time),clean(b.end_time),['scheduled','ready','on-air','done','hold','cancelled'].includes(b.status)?b.status:'scheduled',Number(b.priority)||0,clean(b.notes),b.auto_take===undefined?1:Number(b.auto_take)!==0,['cut','fade','dip','manual'].includes(b.transition)?b.transition:'cut',new Date().toISOString(),req.params.id);res.json(db.prepare('SELECT * FROM playout_events WHERE id=?').get(req.params.id))});
