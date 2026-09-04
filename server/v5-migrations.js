@@ -16,6 +16,11 @@ const statements=[
 `CREATE TABLE IF NOT EXISTS transmission_outputs (id INTEGER PRIMARY KEY AUTOINCREMENT,channel_id INTEGER NOT NULL,name TEXT NOT NULL,type TEXT NOT NULL DEFAULT 'ip',endpoint TEXT DEFAULT '',format TEXT DEFAULT '1080p25',audio_format TEXT DEFAULT 'stereo',enabled INTEGER NOT NULL DEFAULT 1,primary_output INTEGER NOT NULL DEFAULT 0,notes TEXT DEFAULT '',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(channel_id) REFERENCES channels(id) ON DELETE CASCADE)`,
 `CREATE TABLE IF NOT EXISTS playout_events (id INTEGER PRIMARY KEY AUTOINCREMENT,channel_id INTEGER NOT NULL,event_type TEXT NOT NULL,title TEXT NOT NULL,source TEXT DEFAULT '',start_time TEXT,end_time TEXT,status TEXT NOT NULL DEFAULT 'scheduled',priority INTEGER NOT NULL DEFAULT 0,notes TEXT DEFAULT '',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(channel_id) REFERENCES channels(id) ON DELETE CASCADE)`]; for(const s of statements) db.exec(s);
 
+
+// V7 playout automation fields. Safe on existing databases.
+const playoutCols=db.prepare(`PRAGMA table_info(playout_events)`).all().map(x=>x.name);
+if(!playoutCols.includes('auto_take')) db.exec(`ALTER TABLE playout_events ADD COLUMN auto_take INTEGER NOT NULL DEFAULT 1`);
+if(!playoutCols.includes('transition')) db.exec(`ALTER TABLE playout_events ADD COLUMN transition TEXT NOT NULL DEFAULT 'cut'`);
 // V6 broadcast automation: deterministic, server-clocked channel playout.
 db.exec(`CREATE TABLE IF NOT EXISTS broadcast_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
